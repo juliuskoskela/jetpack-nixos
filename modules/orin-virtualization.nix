@@ -210,6 +210,8 @@ in
         "pd_ignore_unused"
       ];
 
+      environment.systemPackages = [ support.dceRmDeinitReplay ];
+
       boot.kernelPackages = lib.mkForce (
         (cfg.dceHost.kernelPackages.extend pkgs.nvidia-jetpack.kernelPackagesOverlay).extend (
           _final: prev: {
@@ -244,6 +246,7 @@ in
                   substituteInPlace nvidia-oot/drivers/platform/tegra/dce/dce-module.c \
                     --replace-fail '#if defined(NV_PLATFORM_DRIVER_STRUCT_REMOVE_RETURNS_VOID) /* Linux v6.11 */' '#if 1 /* Linux 7.1 */'
                 ''}
+                patch -p1 -d nvidia-oot < ${support}/patches/nvidia-oot/dce/0003-dce-client-ipc-wait-timeout.patch
                 install -D ${support}/sources/nvidia-oot/drivers/platform/tegra/dce-host-proxy/dce-host-proxy.c \
                   nvidia-oot/drivers/platform/tegra/dce/dce-host-proxy.c
                 install -D ${support}/sources/nvidia-oot/drivers/platform/tegra/dce-host-proxy/dce-host-proxy.h \

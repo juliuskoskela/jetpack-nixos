@@ -1,0 +1,56 @@
+From: Ghaf contributors <ghaf@tii.ae>
+Subject: [PATCH] dce: bound the client IPC wait for a DCE reply
+
+dce_client_ipc_wait() blocks until the R5 raises the client's completion, and
+restarts the wait whenever a signal interrupts it. A wedged R5 therefore holds
+the caller in tegra_dce_client_ipc_send_recv() for good, even against SIGKILL.
+For the host dce-host proxy that caller is a VMM thread inside write(), which
+cannot be killed, so the VMM and its guest can never be stopped.
+
+Give up after 10 s and return -ETIMEDOUT. The wait is no longer interruptible:
+interruption only ever restarted it, and with a fatal signal pending the
+restart would spin until the deadline. 10 s is far above the latency expected
+of a display RPC while staying well inside the hung-task and systemd stop
+timeouts.
+
+Host only. The guest short-circuits dce_ipc_send_message_sync() through
+tegra_dce_ipc_send_redirect (0001) before it can reach this wait.
+---
+--- a/drivers/platform/tegra/dce/dce-client-ipc.c
++++ b/drivers/platform/tegra/dce/dce-client-ipc.c
+@@ -266,6 +266,12 @@
+ 	destroy_workqueue(d_aipc->async_event_wq);
+ }
+ 
++/*
++ * Upper bound on how long a client RPC waits for the R5 to answer. A wedged R5
++ * would otherwise hold the caller here for good.
++ */
++#define DCE_CLIENT_IPC_WAIT_TIMEOUT_MS	(10U * 1000)
++
+ int dce_client_ipc_wait(struct tegra_dce *d, u32 int_type)
+ {
+ 	uint32_t type;
+@@ -285,11 +291,17 @@
+ 		return -EINVAL;
+ 	}
+ 
+-retry_wait:
+-	DCE_COND_WAIT_INTERRUPTIBLE(&cl->recv_wait,
+-			atomic_read(&cl->complete) == 1);
+-	if (atomic_read(&cl->complete) != 1)
+-		goto retry_wait;
++	/*
++	 * Not interruptible: signals only restarted the wait, and with one
++	 * pending the restart would spin until the deadline.
++	 */
++	if (!wait_event_timeout(cl->recv_wait.wq,
++				atomic_read(&cl->complete) == 1,
++				msecs_to_jiffies(DCE_CLIENT_IPC_WAIT_TIMEOUT_MS))) {
++		dce_err(d, "Timed out waiting for DCE reply on int_type: [%d]",
++			int_type);
++		return -ETIMEDOUT;
++	}
+ 
+ 	atomic_set(&cl->complete, 0);
+ 

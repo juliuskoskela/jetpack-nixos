@@ -45,6 +45,25 @@ let
       ${lib.getExe' pkgs.kmod "modprobe"} -r "''${loaded[@]}" || ${lib.getExe' pkgs.coreutils "sleep"} 1
     done
   '';
+  displayAssignments = lib.filterAttrs (_: assignment: assignment.role == "display" || assignment.role == "combined") hostAssignments;
+  # The dce-host proxy tracks whether the DCE firmware RM is initialized. A guest
+  # started over a stale or wedged RM fails to bring up its display and can hang.
+  dceRmStateFile = "/sys/class/dce_chardrv/dce-host/rm_state";
+  dceRmStateGuard = pkgs.writeShellScript "dce-rm-state-guard" ''
+    # The proxy replays the guest's RM deinit after it exits; give it a moment.
+    for _ in {1..30}; do
+      if ! state=$(<${dceRmStateFile}); then
+        echo "dce-rm-state-guard: cannot read ${dceRmStateFile}; is dce-host-proxy loaded?" >&2
+        exit 1
+      fi
+      [ "$state" = tearing_down ] || break
+      ${lib.getExe' pkgs.coreutils "sleep"} 1
+    done
+    if [ "$state" != clean ]; then
+      echo "dce-rm-state-guard: DCE RM state is '$state', not 'clean'; a previous display guest left the DCE firmware initialized or failed to tear it down. Reboot the host to restore the display." >&2
+      exit 1
+    fi
+  '';
   kmscube-wrapped = pkgs.runCommand "kmscube-nomod" { nativeBuildInputs = [ pkgs.buildPackages.makeWrapper ]; } ''
     mkdir -p $out/bin
     makeWrapper ${pkgs.kmscube}/bin/kmscube $out/bin/kmscube \
@@ -135,11 +154,21 @@ in
       services.udev.extraRules = ''
         SUBSYSTEM=="vfio", GROUP="kvm"
       '';
-      systemd.services = lib.mapAttrs'
-        (
-          name: payload: lib.nameValuePair (bindServiceName name) (bindService name payload)
-        )
-        payloads;
+      systemd.services =
+        lib.mapAttrs'
+          (
+            name: payload: lib.nameValuePair (bindServiceName name) (bindService name payload)
+          )
+          payloads
+        // lib.mapAttrs'
+          (
+            name: _:
+              lib.nameValuePair "microvm@${name}" {
+                overrideStrategy = "asDropin";
+                serviceConfig.ExecStartPre = [ dceRmStateGuard ];
+              }
+          )
+          displayAssignments;
     })
 
     (lib.mkIf gpuOwner {
