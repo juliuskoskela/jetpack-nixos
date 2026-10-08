@@ -17,6 +17,7 @@
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 #include <linux/version.h>
 #include <linux/platform/tegra/dce/dce-client-ipc.h>
 #include "dce-host-proxy.h"
@@ -54,6 +55,7 @@ MODULE_VERSION("0.1");
  */
 #define DCE_RPC_RM_INIT 168
 #define DCE_RPC_RESULT_OFFSET 16
+#define DCE_RPC_RESULT_PRIVATE_OFFSET 20
 #define DCE_RPC_RM_INIT_BINIT_OFFSET 32
 #define DCE_RPC_RM_INIT_LEN (DCE_RPC_RM_INIT_BINIT_OFFSET + sizeof(u32))
 #define DCE_RPC_RESULT_OK 0
@@ -103,15 +105,25 @@ static enum dce_rm_state dce_rm_state = DCE_RM_CLEAN;
 static u8 dce_rm_init_frame[DCE_RPC_RM_INIT_LEN];
 static bool dce_rm_init_frame_valid;
 
-static void dce_rm_set_state(enum dce_rm_state state)
+/* Teardown replay for a guest that exited with RM live; see close(). */
+static void dce_rm_teardown_fn(struct work_struct *work);
+static DECLARE_WORK(dce_rm_teardown_work, dce_rm_teardown_fn);
+
+/* Caller holds dce_rm_state_lock. */
+static void dce_rm_set_state_locked(enum dce_rm_state state)
 {
-	mutex_lock(&dce_rm_state_lock);
 	if (dce_rm_state != DCE_RM_FAILED && dce_rm_state != state) {
 		pr_info("dce_host_proxy: RM state %s -> %s\n",
 			dce_rm_state_names[dce_rm_state],
 			dce_rm_state_names[state]);
 		dce_rm_state = state;
 	}
+}
+
+static void dce_rm_set_state(enum dce_rm_state state)
+{
+	mutex_lock(&dce_rm_state_lock);
+	dce_rm_set_state_locked(state);
 	mutex_unlock(&dce_rm_state_lock);
 }
 
@@ -413,6 +425,9 @@ static int dce_host_proxy_remove_impl(struct platform_device *pdev)
 {
 	deb_info("removing module.\n");
 
+	// A queued or running teardown replay still needs its client.
+	flush_work(&dce_rm_teardown_work);
+
 	dce_host_proxy_unregister_clients();
 
 	// Both clients gone: no callback can queue any more, safe to free the
@@ -473,12 +488,29 @@ static int open(struct inode *inodep, struct file *filep)
 
 static int close(struct inode *inodep, struct file *filep)
 {
+	bool replay = false;
+
+	/*
+	 * A guest that exits with RM live never ran its shutdown. Replay the
+	 * deinit from a worker, on the still-registered CPU_RM client, and let
+	 * that worker unregister. open() stays refused until it is done.
+	 */
+	mutex_lock(&dce_rm_state_lock);
+	if (dce_rm_state == DCE_RM_LIVE && dce_rm_init_frame_valid) {
+		dce_rm_set_state_locked(DCE_RM_TEARING_DOWN);
+		replay = true;
+	}
+	mutex_unlock(&dce_rm_state_lock);
+
 	/*
 	 * A new VMM must register fresh CPU_RM and RM_EVENT clients. DCE keeps
 	 * per-client channel state, so retaining these handles after Crosvm exits
 	 * leaves the next guest unable to map its register space.
 	 */
-	dce_host_proxy_unregister_clients();
+	if (replay)
+		queue_work(system_long_wq, &dce_rm_teardown_work);
+	else
+		dce_host_proxy_unregister_clients();
 	dce_host_proxy_reset_events();
 	atomic_set(&dce_host_proxy_opened, 0);
 	deb_info("device closed.\n");
@@ -611,6 +643,86 @@ static void dce_host_proxy_ensure_event_client(void)
 }
 
 #define BUF_SIZE DCE_CLIENT_MAX_IPC_MSG_SIZE
+
+/*
+ * Send the saved RM_INIT(1) frame again as RM_INIT(0), the way the guest's RM
+ * builds the shutdown: bInit cleared and both result fields back to pending.
+ * Runs after close() of a guest that exited live. The RPC goes out on the
+ * still-registered CPU_RM client, which is only unregistered afterwards. The
+ * state ends clean if DCE acknowledged the deinit, failed otherwise; open() is
+ * refused throughout.
+ */
+static void dce_rm_teardown_fn(struct work_struct *work)
+{
+	const u32 pending = ~DCE_RPC_RESULT_OK;
+	const u32 deinit = 0;
+	enum dce_rm_state result = DCE_RM_FAILED;
+	struct dce_ipc_message m;
+	u32 rpc_result = pending;
+	bool registered;
+	u32 handle;
+	u8 *txbuf;
+	u8 *rxbuf;
+	int ret;
+
+	txbuf = kzalloc(BUF_SIZE, GFP_KERNEL);
+	rxbuf = kzalloc(BUF_SIZE, GFP_KERNEL);
+	if (!txbuf || !rxbuf) {
+		pr_err("dce_host_proxy: no memory to replay RM deinit\n");
+		goto out;
+	}
+
+	mutex_lock(&dce_rm_state_lock);
+	memcpy(txbuf, dce_rm_init_frame, sizeof(dce_rm_init_frame));
+	mutex_unlock(&dce_rm_state_lock);
+
+	memcpy(txbuf + DCE_RPC_RESULT_OFFSET, &pending, sizeof(pending));
+	memcpy(txbuf + DCE_RPC_RESULT_PRIVATE_OFFSET, &pending, sizeof(pending));
+	memcpy(txbuf + DCE_RPC_RM_INIT_BINIT_OFFSET, &deinit, sizeof(deinit));
+	/* Request and response share one buffer in the guest's RM. */
+	memcpy(rxbuf, txbuf, DCE_RPC_RM_INIT_LEN);
+
+	mutex_lock(&dce_host_client_lock);
+	registered = dce_host_client_registered;
+	handle = dce_host_client_handle;
+	mutex_unlock(&dce_host_client_lock);
+	if (!registered) {
+		pr_err("dce_host_proxy: no CPU_RM client to replay RM deinit\n");
+		goto out;
+	}
+
+	m.tx.data = txbuf;
+	m.tx.size = DCE_RPC_RM_INIT_LEN;
+	m.rx.data = rxbuf;
+	m.rx.size = DCE_RPC_RM_INIT_LEN;
+
+	ret = tegra_dce_client_ipc_send_recv(handle, &m);
+	if (ret) {
+		pr_err("dce_host_proxy: RM deinit replay failed: %d\n", ret);
+		goto out;
+	}
+
+	memcpy(&rpc_result, rxbuf + DCE_RPC_RESULT_OFFSET, sizeof(rpc_result));
+	if (rpc_result != DCE_RPC_RESULT_OK) {
+		pr_err("dce_host_proxy: RM deinit replay rejected, rpc_result=0x%x\n",
+		       rpc_result);
+		goto out;
+	}
+
+	pr_info("dce_host_proxy: replayed RM deinit after the guest exited\n");
+	result = DCE_RM_CLEAN;
+out:
+	kfree(txbuf);
+	kfree(rxbuf);
+
+	dce_host_proxy_unregister_clients();
+	dce_host_proxy_reset_events();
+
+	mutex_lock(&dce_rm_state_lock);
+	dce_rm_init_frame_valid = false;
+	dce_rm_set_state_locked(result);
+	mutex_unlock(&dce_rm_state_lock);
+}
 
 static ssize_t write(struct file *filep, const char *buffer, size_t len, loff_t *offset)
 {

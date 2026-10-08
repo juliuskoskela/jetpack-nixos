@@ -50,10 +50,15 @@ let
   # started over a stale or wedged RM fails to bring up its display and can hang.
   dceRmStateFile = "/sys/class/dce_chardrv/dce-host/rm_state";
   dceRmStateGuard = pkgs.writeShellScript "dce-rm-state-guard" ''
-    if ! state=$(<${dceRmStateFile}); then
-      echo "dce-rm-state-guard: cannot read ${dceRmStateFile}; is dce-host-proxy loaded?" >&2
-      exit 1
-    fi
+    # The proxy replays the guest's RM deinit after it exits; give it a moment.
+    for _ in {1..30}; do
+      if ! state=$(<${dceRmStateFile}); then
+        echo "dce-rm-state-guard: cannot read ${dceRmStateFile}; is dce-host-proxy loaded?" >&2
+        exit 1
+      fi
+      [ "$state" = tearing_down ] || break
+      ${lib.getExe' pkgs.coreutils "sleep"} 1
+    done
     if [ "$state" != clean ]; then
       echo "dce-rm-state-guard: DCE RM state is '$state', not 'clean'; a previous display guest left the DCE firmware initialized or failed to tear it down. Reboot the host to restore the display." >&2
       exit 1
