@@ -98,6 +98,7 @@ let
         ./stuart-passthru-compiler-prefix.diff
         ./repeatability.diff
         ./add-extra-oui-for-mgbe-phy.diff
+        ../reserve-dtb-ranges.diff
 
       ] ++ lib.optionals (trustedPublicCertPemFile != null) [
         ./capsule-authentication.diff

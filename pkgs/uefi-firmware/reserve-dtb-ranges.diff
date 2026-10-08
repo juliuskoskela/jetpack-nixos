@@ -1,0 +1,186 @@
+--- a/Silicon/NVIDIA/PrePi/PrePi.c
++++ b/Silicon/NVIDIA/PrePi/PrePi.c
+@@ -224,6 +224,173 @@
+   }
+ }
+ 
++/**
++  Check whether a range is entirely backed by system memory resource
++  descriptors.
++
++  @param[in]  Base    Start of the range.
++  @param[in]  Length  Length of the range, non-zero, Base + Length must not wrap.
++
++  @retval TRUE   Every byte of the range lies in system memory.
++  @retval FALSE  Some part of the range is not system memory.
++**/
++STATIC
++BOOLEAN
++IsRangeSystemMemory (
++  IN UINT64  Base,
++  IN UINT64  Length
++  )
++{
++  EFI_PEI_HOB_POINTERS  NextHob;
++  UINT64                Cursor;
++  UINT64                End;
++  BOOLEAN               Advanced;
++
++  Cursor = Base;
++  End    = Base + Length;
++
++  // Resource descriptors may split DRAM, so walk the range one descriptor at a time.
++  do {
++    Advanced    = FALSE;
++    NextHob.Raw = GetHobList ();
++    while ((NextHob.Raw = GetNextHob (EFI_HOB_TYPE_RESOURCE_DESCRIPTOR, NextHob.Raw)) != NULL) {
++      if ((NextHob.ResourceDescriptor->ResourceType == EFI_RESOURCE_SYSTEM_MEMORY) &&
++          (Cursor >= NextHob.ResourceDescriptor->PhysicalStart) &&
++          (Cursor < NextHob.ResourceDescriptor->PhysicalStart + NextHob.ResourceDescriptor->ResourceLength))
++      {
++        Cursor   = NextHob.ResourceDescriptor->PhysicalStart + NextHob.ResourceDescriptor->ResourceLength;
++        Advanced = TRUE;
++        break;
++      }
++
++      NextHob.Raw = GET_NEXT_HOB (NextHob);
++    }
++  } while (Advanced && (Cursor < End));
++
++  return Cursor >= End;
++}
++
++/**
++  Check whether a range overlaps an existing memory allocation HOB.
++
++  @param[in]  Base    Start of the range.
++  @param[in]  Length  Length of the range, non-zero, Base + Length must not wrap.
++
++  @retval TRUE   The range overlaps an existing allocation.
++  @retval FALSE  The range is free.
++**/
++STATIC
++BOOLEAN
++IsRangeAllocated (
++  IN UINT64  Base,
++  IN UINT64  Length
++  )
++{
++  EFI_PEI_HOB_POINTERS  NextHob;
++  UINT64                AllocBase;
++  UINT64                AllocEnd;
++
++  NextHob.Raw = GetHobList ();
++  while ((NextHob.Raw = GetNextHob (EFI_HOB_TYPE_MEMORY_ALLOCATION, NextHob.Raw)) != NULL) {
++    AllocBase = NextHob.MemoryAllocation->AllocDescriptor.MemoryBaseAddress;
++    AllocEnd  = AllocBase + NextHob.MemoryAllocation->AllocDescriptor.MemoryLength;
++    if ((Base < AllocEnd) && (AllocBase < Base + Length)) {
++      return TRUE;
++    }
++
++    NextHob.Raw = GET_NEXT_HOB (NextHob);
++  }
++
++  return FALSE;
++}
++
++/**
++  Mark ranges listed in the UEFI DTB as allocated memory.
++
++  The kernel reserves some RAM ranges in its own device tree, for example for
++  VM passthrough carve-outs. UEFI never turns /reserved-memory into memory map
++  entries, so the ranges are reported as EfiConventionalMemory and the arm64
++  EFI stub may place a randomized kernel image inside them.
++
++  A node /firmware/uefi/reserved-ranges with compatible
++  "ghaf,uefi-reserved-ranges" and a "reg" property of 64-bit (base, size)
++  pairs, normally added by a "uefi" DTB overlay, lists the ranges. Each range
++  becomes a memory allocation HOB, by default of type EfiBootServicesData.
++  Linux treats that as ordinary RAM after ExitBootServices, so the kernel
++  device tree stays the only thing that withholds the range from the kernel.
++  With the boolean property "ghaf,reserved-memory-type-reserved" the type is
++  EfiReservedMemoryType instead, which Linux will not map.
++
++  Ranges that are not entirely system memory, or that overlap an allocation
++  HOB, are skipped with an error message. Adding an overlapping allocation
++  HOB would trip an assert in the DXE core memory map handling.
++**/
++STATIC
++VOID
++ReserveDtbRanges (
++  VOID
++  )
++{
++  EFI_STATUS       Status;
++  VOID             *Dtb;
++  UINTN            DtbSize;
++  INT32            Node;
++  CONST fdt32_t    *Reg;
++  INT32            Length;
++  UINT32           Count;
++  UINT32           Index;
++  UINT64           Base;
++  UINT64           Size;
++  EFI_MEMORY_TYPE  MemoryType;
++
++  Status = DtPlatformLoadDtb (&Dtb, &DtbSize);
++  if (EFI_ERROR (Status)) {
++    return;
++  }
++
++  Node = fdt_path_offset (Dtb, "/firmware/uefi/reserved-ranges");
++  if ((Node < 0) || (fdt_node_check_compatible (Dtb, Node, "ghaf,uefi-reserved-ranges") != 0)) {
++    return;
++  }
++
++  MemoryType = EfiBootServicesData;
++  if (fdt_getprop (Dtb, Node, "ghaf,reserved-memory-type-reserved", NULL) != NULL) {
++    MemoryType = EfiReservedMemoryType;
++  }
++
++  Reg = fdt_getprop (Dtb, Node, "reg", &Length);
++  if ((Reg == NULL) || (Length <= 0) || ((Length % (4 * sizeof (fdt32_t))) != 0)) {
++    DEBUG ((DEBUG_ERROR, "Reserved ranges: missing or malformed reg property\n"));
++    return;
++  }
++
++  Count = Length / (4 * sizeof (fdt32_t));
++  for (Index = 0; Index < Count; Index++) {
++    Base = ((UINT64)fdt32_to_cpu (Reg[Index * 4]) << 32) | fdt32_to_cpu (Reg[Index * 4 + 1]);
++    Size = ((UINT64)fdt32_to_cpu (Reg[Index * 4 + 2]) << 32) | fdt32_to_cpu (Reg[Index * 4 + 3]);
++
++    if ((Size == 0) || ((Base & EFI_PAGE_MASK) != 0) || ((Size & EFI_PAGE_MASK) != 0) ||
++        (Base + Size < Base))
++    {
++      DEBUG ((DEBUG_ERROR, "Reserved ranges: skipping invalid range 0x%lx+0x%lx\n", Base, Size));
++      continue;
++    }
++
++    if (!IsRangeSystemMemory (Base, Size)) {
++      DEBUG ((DEBUG_ERROR, "Reserved ranges: skipping 0x%lx+0x%lx, not system memory\n", Base, Size));
++      continue;
++    }
++
++    if (IsRangeAllocated (Base, Size)) {
++      DEBUG ((DEBUG_ERROR, "Reserved ranges: skipping 0x%lx+0x%lx, overlaps an allocation\n", Base, Size));
++      continue;
++    }
++
++    DEBUG ((DEBUG_ERROR, "Reserved ranges: 0x%lx+0x%lx as memory type %d\n", Base, Size, MemoryType));
++    BuildMemoryAllocationHob (Base, Size, MemoryType);
++  }
++}
++
+ VOID
+ CEntryPoint (
+   IN  UINTN  MemoryBase,
+@@ -492,6 +659,9 @@
+   // Create DTB memory allocation HOB
+   BuildMemoryAllocationHob (DtbBase, DtbSize, EfiBootServicesData);
+ 
++  // Keep the kernel image out of ranges the kernel device tree reserves
++  ReserveDtbRanges ();
++
+   // Create the Stacks HOB (reserve the memory for all stacks)
+   BuildStackHob (StackBase, StackSize + SIZE_4KB);
+ 
