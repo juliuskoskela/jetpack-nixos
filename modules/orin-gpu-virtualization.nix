@@ -17,7 +17,11 @@ let
   displayOwner = roleEnabled "display" || roleEnabled "combined";
   guestPayload = roles.${cfg.gpuPassthroughGuest.role};
   displayCard = support.passthrough.displayCardPath;
-  hasCompositor = config.services.greetd.enable;
+  # Display servers that hold DRM master in place of kms-owner.
+  compositorServices =
+    lib.optional config.services.greetd.enable "greetd.service"
+    ++ lib.optional config.services.cage.enable "cage-tty1.service";
+  hasCompositor = compositorServices != [ ];
   kmscube-wrapped = pkgs.runCommand "kmscube-nomod" { nativeBuildInputs = [ pkgs.buildPackages.makeWrapper ]; } ''
     mkdir -p $out/bin
     makeWrapper ${pkgs.kmscube}/bin/kmscube $out/bin/kmscube \
@@ -164,7 +168,7 @@ in
       systemd.services.dce-rm-deinit = lib.mkIf guestPayload.needsDceBridge {
         description = "Deinitialize NVIDIA DCE RM before the display guest powers off";
         wantedBy = [ "multi-user.target" ];
-        before = lib.optional (!hasCompositor) "kms-owner.service" ++ lib.optional hasCompositor "greetd.service";
+        before = if hasCompositor then compositorServices else [ "kms-owner.service" ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
