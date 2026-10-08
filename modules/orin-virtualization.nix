@@ -210,6 +210,8 @@ in
         "pd_ignore_unused"
       ];
 
+      environment.systemPackages = [ support.dceRmDeinitReplay ];
+
       boot.kernelPackages = lib.mkForce (
         (cfg.dceHost.kernelPackages.extend pkgs.nvidia-jetpack.kernelPackagesOverlay).extend (
           _final: prev: {

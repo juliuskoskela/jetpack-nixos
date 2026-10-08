@@ -14,6 +14,13 @@ let
     $CC -O2 -fPIC -shared -o "$out/lib/gbm-nomod-shim.so" \
       ${./sources/userspace/gbm-nomod-shim.c} -ldl
   '';
+  dceRmDeinitReplay = runCommandCC "dce-rm-deinit-replay" { } ''
+    mkdir -p "$out/bin"
+    $CC -O2 -Wall -Wextra \
+      -I${./sources/nvidia-oot/drivers/platform/tegra/dce-host-proxy} \
+      -o "$out/bin/dce-rm-deinit-replay" \
+      ${./sources/userspace/dce-rm-deinit-replay.c}
+  '';
   quiesceMgbe0 = writeShellApplication {
     name = "quiesce-mgbe0";
     runtimeInputs = [ iproute2 ];
@@ -49,7 +56,7 @@ runCommand "orin-virtualization-support"
 {
   preferLocalBuild = true;
   passthru = import ./manifest.nix { inherit lib; } // {
-    inherit gbmNoModifiersShim quiesceMgbe0;
+    inherit gbmNoModifiersShim dceRmDeinitReplay quiesceMgbe0;
     eglGbmSingleDevicePatch = ./patches/userspace/egl-gbm-single-device-fallback.patch;
     mkGuestDtb = import ./builders/mk-guest-dtb.nix { inherit lib; };
     mkCrosvmOverlay = import ./builders/mk-crosvm-overlay.nix { inherit lib; };
