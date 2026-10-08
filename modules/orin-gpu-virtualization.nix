@@ -17,7 +17,34 @@ let
   displayOwner = roleEnabled "display" || roleEnabled "combined";
   guestPayload = roles.${cfg.gpuPassthroughGuest.role};
   displayCard = support.passthrough.displayCardPath;
-  hasCompositor = config.services.greetd.enable;
+  # Display servers that hold DRM master in place of kms-owner.
+  compositorServices =
+    lib.optional config.services.greetd.enable "greetd.service"
+    ++ lib.optional config.services.cage.enable "cage-tty1.service";
+  hasCompositor = compositorServices != [ ];
+  dceTeardownTimeout = 30;
+  # nvidia_drm stays busy until the compositor's last flip completes, so a single
+  # unload can fail. modprobe --wait is not used: kmod 31 reports success when it
+  # times out.
+  dceRmDeinitStop = pkgs.writeShellScript "dce-rm-deinit-stop" ''
+    deadline=$((SECONDS + ${toString (dceTeardownTimeout - 5)}))
+    while :; do
+      loaded=()
+      for module in nvidia_drm nvidia_modeset nvidia; do
+        if [ -d "/sys/module/$module" ]; then
+          loaded+=("$module")
+        fi
+      done
+      if [ ''${#loaded[@]} -eq 0 ]; then
+        exit 0
+      fi
+      if ((SECONDS >= deadline)); then
+        echo "<3>dce-rm-deinit: DCE teardown failed, ''${loaded[*]} still loaded" >/dev/kmsg
+        exit 1
+      fi
+      ${lib.getExe' pkgs.kmod "modprobe"} -r "''${loaded[@]}" || ${lib.getExe' pkgs.coreutils "sleep"} 1
+    done
+  '';
   kmscube-wrapped = pkgs.runCommand "kmscube-nomod" { nativeBuildInputs = [ pkgs.buildPackages.makeWrapper ]; } ''
     mkdir -p $out/bin
     makeWrapper ${pkgs.kmscube}/bin/kmscube $out/bin/kmscube \
@@ -164,13 +191,13 @@ in
       systemd.services.dce-rm-deinit = lib.mkIf guestPayload.needsDceBridge {
         description = "Deinitialize NVIDIA DCE RM before the display guest powers off";
         wantedBy = [ "multi-user.target" ];
-        before = lib.optional (!hasCompositor) "kms-owner.service" ++ lib.optional hasCompositor "greetd.service";
+        before = if hasCompositor then compositorServices else [ "kms-owner.service" ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
           ExecStart = lib.getExe' pkgs.coreutils "true";
-          ExecStop = "${lib.getExe' pkgs.kmod "modprobe"} -r nvidia_drm nvidia_modeset nvidia";
-          TimeoutStopSec = "30";
+          ExecStop = dceRmDeinitStop;
+          TimeoutStopSec = toString dceTeardownTimeout;
         };
       };
 
