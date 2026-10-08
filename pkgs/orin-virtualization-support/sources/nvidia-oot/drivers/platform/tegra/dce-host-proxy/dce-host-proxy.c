@@ -47,6 +47,17 @@ MODULE_VERSION("0.1");
 #define DCE_RPC_POST_EVENT 0x1003
 #define DCE_RPC_POST_HEVENT_OFFSET 36
 
+/*
+ * Guest RM init/deinit RPC: rpc_message_header_v03_00 (32 bytes, function at
+ * 12, rpc_result at 16) followed by rpc_dce_rm_init_v01_00, whose only field
+ * is bInit. The RPC result is an NV_STATUS; NV_OK is 0.
+ */
+#define DCE_RPC_RM_INIT 168
+#define DCE_RPC_RESULT_OFFSET 16
+#define DCE_RPC_RM_INIT_BINIT_OFFSET 32
+#define DCE_RPC_RM_INIT_LEN (DCE_RPC_RM_INIT_BINIT_OFFSET + sizeof(u32))
+#define DCE_RPC_RESULT_OK 0
+
 static int major_number;
 
 static struct class *dce_host_proxy_class = NULL;
@@ -58,6 +69,88 @@ static atomic_t dce_host_proxy_opened = ATOMIC_INIT(0);
 static DEFINE_MUTEX(dce_host_client_lock);
 static u32 dce_host_client_handle;
 static bool dce_host_client_registered;
+
+/*
+ * Whether the host-owned DCE RM is initialized, as far as the guest's RM_INIT
+ * RPCs show. Nothing here can reset the firmware's RM, so a guest that exits
+ * with RM still initialized leaves the next guest's RM_INIT(1) failing, and a
+ * failed or timed-out RPC leaves the R5 in an unknown state.
+ *
+ *   clean         no RM initialized; a guest may attach
+ *   live          a guest initialized RM and has not shut it down
+ *   tearing_down  a deinit is in flight
+ *   failed        an RPC failed or timed out; sticky until module reload
+ *
+ * dce_rm_state_lock protects the state and the saved init frame. Never held
+ * across an IPC send.
+ */
+enum dce_rm_state {
+	DCE_RM_CLEAN,
+	DCE_RM_LIVE,
+	DCE_RM_TEARING_DOWN,
+	DCE_RM_FAILED,
+};
+
+static const char * const dce_rm_state_names[] = {
+	[DCE_RM_CLEAN] = "clean",
+	[DCE_RM_LIVE] = "live",
+	[DCE_RM_TEARING_DOWN] = "tearing_down",
+	[DCE_RM_FAILED] = "failed",
+};
+
+static DEFINE_MUTEX(dce_rm_state_lock);
+static enum dce_rm_state dce_rm_state = DCE_RM_CLEAN;
+static u8 dce_rm_init_frame[DCE_RPC_RM_INIT_LEN];
+static bool dce_rm_init_frame_valid;
+
+static void dce_rm_set_state(enum dce_rm_state state)
+{
+	mutex_lock(&dce_rm_state_lock);
+	if (dce_rm_state != DCE_RM_FAILED && dce_rm_state != state) {
+		pr_info("dce_host_proxy: RM state %s -> %s\n",
+			dce_rm_state_names[dce_rm_state],
+			dce_rm_state_names[state]);
+		dce_rm_state = state;
+	}
+	mutex_unlock(&dce_rm_state_lock);
+}
+
+static ssize_t rm_state_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	enum dce_rm_state state;
+
+	mutex_lock(&dce_rm_state_lock);
+	state = dce_rm_state;
+	mutex_unlock(&dce_rm_state_lock);
+
+	return sysfs_emit(buf, "%s\n", dce_rm_state_names[state]);
+}
+static DEVICE_ATTR_RO(rm_state);
+
+static struct attribute *dce_host_proxy_attrs[] = {
+	&dev_attr_rm_state.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(dce_host_proxy);
+
+/* Is this tx frame a guest RM_INIT RPC? If so, report its bInit. */
+static bool dce_rm_init_sniff(const void *data, size_t len, u32 *binit)
+{
+	u32 function;
+
+	if (!data || len < DCE_RPC_RM_INIT_LEN)
+		return false;
+
+	memcpy(&function, (const u8 *)data + DCE_RPC_FUNCTION_OFFSET,
+	       sizeof(function));
+	if (function != DCE_RPC_RM_INIT)
+		return false;
+
+	memcpy(binit, (const u8 *)data + DCE_RPC_RM_INIT_BINIT_OFFSET,
+	       sizeof(*binit));
+	return true;
+}
 
 /*
  * Reverse doorbell, host end. DCE pushes unsolicited notifications (RM_NOTIFY --
@@ -299,7 +392,8 @@ static int dce_host_proxy_probe(struct platform_device *pdev)
 	}
 	deb_info("device class registered correctly\n");
 
-	dce_host_proxy_device = device_create(dce_host_proxy_class, NULL, MKDEV(major_number, 0), NULL, DEVICE_NAME);
+	dce_host_proxy_device = device_create_with_groups(dce_host_proxy_class, NULL, MKDEV(major_number, 0), NULL,
+							  dce_host_proxy_groups, DEVICE_NAME);
 	if (IS_ERR(dce_host_proxy_device))
 	{
 		class_destroy(dce_host_proxy_class);
@@ -353,8 +447,24 @@ static int dce_host_proxy_remove(struct platform_device *pdev)
 
 static int open(struct inode *inodep, struct file *filep)
 {
-	if (atomic_cmpxchg(&dce_host_proxy_opened, 0, 1) != 0)
+	const char *why = "";
+
+	mutex_lock(&dce_rm_state_lock);
+	if (dce_rm_state != DCE_RM_CLEAN) {
+		if (dce_rm_state == DCE_RM_LIVE)
+			why = " (a guest exited without deinitializing RM)";
+		else if (dce_rm_state == DCE_RM_FAILED)
+			why = " (reload the module or reboot the host)";
+		pr_warn("dce_host_proxy: refusing open, DCE RM state is %s%s\n",
+			dce_rm_state_names[dce_rm_state], why);
+		mutex_unlock(&dce_rm_state_lock);
 		return -EBUSY;
+	}
+	if (atomic_cmpxchg(&dce_host_proxy_opened, 0, 1) != 0) {
+		mutex_unlock(&dce_rm_state_lock);
+		return -EBUSY;
+	}
+	mutex_unlock(&dce_rm_state_lock);
 
 	dce_host_proxy_reset_events();
 	deb_info("device opened.\n");
@@ -512,6 +622,9 @@ static ssize_t write(struct file *filep, const char *buffer, size_t len, loff_t 
 	void *usertxbuf = NULL;
 	void *userrxbuf = NULL;
 	struct dce_ipc_message m;
+	size_t rx_requested;
+	bool rm_init;
+	u32 binit = 0;
 
 	if (len > 65535) {	/* paranoia */
 		deb_error("count %zu exceeds max # of bytes allowed, "
@@ -525,6 +638,15 @@ static ssize_t write(struct file *filep, const char *buffer, size_t len, loff_t 
 		ret = -EINVAL;
 		goto out_nomem;
 	}
+
+	/* A failed RPC may have wedged the R5; don't risk another wait on it. */
+	mutex_lock(&dce_rm_state_lock);
+	if (dce_rm_state == DCE_RM_FAILED) {
+		mutex_unlock(&dce_rm_state_lock);
+		deb_error("DCE RM state is failed, rejecting write\n");
+		return -EIO;
+	}
+	mutex_unlock(&dce_rm_state_lock);
 
 	ret = -ENOMEM;
 	kbuf = kmalloc(len, GFP_KERNEL);
@@ -597,8 +719,41 @@ static ssize_t write(struct file *filep, const char *buffer, size_t len, loff_t 
 	m.rx.data = rxbuf;
 	m.rx.size = kbuf->rx.size;
 
+	rx_requested = kbuf->rx.size;
+	rm_init = dce_rm_init_sniff(txbuf, kbuf->tx.size, &binit);
+
 	ret = tegra_dce_client_ipc_send_recv(dce_host_client_handle, &m);
 	kbuf->ret = ret;
+
+	if (ret) {
+		/* Includes a timed-out wait: the R5 state is now unknown. */
+		pr_err("dce_host_proxy: DCE IPC failed: %d\n", ret);
+		dce_rm_set_state(DCE_RM_FAILED);
+	} else if (rm_init) {
+		u32 rpc_result = ~DCE_RPC_RESULT_OK;
+
+		if (rx_requested >= DCE_RPC_RESULT_OFFSET + sizeof(rpc_result))
+			memcpy(&rpc_result, (u8 *)rxbuf + DCE_RPC_RESULT_OFFSET,
+			       sizeof(rpc_result));
+
+		if (rpc_result != DCE_RPC_RESULT_OK) {
+			/*
+			 * DCE refused the RM transition, so its RM state no longer
+			 * matches ours. A guest that boots over it can lock up.
+			 */
+			pr_err("dce_host_proxy: RM_INIT(%u) failed, rpc_result=0x%x\n",
+			       binit, rpc_result);
+			dce_rm_set_state(DCE_RM_FAILED);
+		} else if (binit) {
+			mutex_lock(&dce_rm_state_lock);
+			memcpy(dce_rm_init_frame, txbuf, sizeof(dce_rm_init_frame));
+			dce_rm_init_frame_valid = true;
+			mutex_unlock(&dce_rm_state_lock);
+			dce_rm_set_state(DCE_RM_LIVE);
+		} else {
+			dce_rm_set_state(DCE_RM_CLEAN);
+		}
+	}
 	/* Clamp DCE's reported rx length to the capacity we handed it (bounded to
 	 * BUF_SIZE above): a corrupted DCE reporting more would drive an OOB read
 	 * of the bounce buffer and an oversized copy_to_user into QEMU. */
