@@ -21,6 +21,11 @@ let
       };
     };
 
+    # Kernel /reserved-memory carve-outs for the VMs. The node name is the
+    # symbol without its "_p" suffix. dispVmRam marks the ranges that the host
+    # overlay only reserves when built with GHAF_INCLUDE_DISPVM_RAM. The UEFI
+    # reserved-ranges overlay is generated from this table, and
+    # builders/mk-uefi-reserved-ranges.nix checks it against the kernel dts.
     reservedMemory = {
       vmHs = {
         dev = "60000000.vm_hs_p";
@@ -45,12 +50,14 @@ let
         base = hex "0xb8000000";
         size = hex "0x2e000000";
         symbol = "dispram_lo_p";
+        dispVmRam = true;
       };
       dispRamHigh = {
         dev = "200000000.dispram_hi_p";
         base = hex "0x200000000";
         size = hex "0x1a000000";
         symbol = "dispram_hi_p";
+        dispVmRam = true;
       };
     };
 

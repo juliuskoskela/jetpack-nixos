@@ -109,6 +109,21 @@ in
       description = "Orin GPU/display passthrough assignments keyed by guest name.";
     };
 
+    gpuPassthroughHost.uefiReservedMemoryType = lib.mkOption {
+      type = lib.types.enum [
+        "boot-services-data"
+        "reserved"
+      ];
+      default = "boot-services-data";
+      description = ''
+        Memory type UEFI reports for the VM carve-outs. boot-services-data keeps
+        the EFI stub out of them and Linux still sees ordinary RAM that the
+        kernel device tree reserves. reserved reports EfiReservedMemoryType,
+        which Linux treats as no-map; check it with removed-dma-pool and VFIO
+        before relying on it.
+      '';
+    };
+
     gpuPassthroughGuest = {
       enable = lib.mkEnableOption "Orin GPU/display passthrough guest support";
       kernelPackages = lib.mkOption {
@@ -150,6 +165,18 @@ in
         bpmpHost.consumers = lib.mapAttrs (_: assignment: support.bpmpPolicies.${assignment.role}) hostAssignments;
         dceHost.enable = displayOwner;
       };
+
+      # UEFI ignores the kernel /reserved-memory nodes and reports the VM
+      # carve-outs as conventional memory, so KASLR can place the kernel in
+      # one. Have UEFI reserve them too. This lives in the CPU-BL DTB and the
+      # QSPI firmware, so it only takes effect after a reflash.
+      hardware.nvidia-jetpack.flashScriptOverrides.additionalDtbOverlays = [
+        (support.mkUefiReservedRanges {
+          inherit pkgs support;
+          includeDispVmRam = roleEnabled "compute";
+          memoryType = cfg.gpuPassthroughHost.uefiReservedMemoryType;
+        })
+      ];
 
       services.udev.extraRules = ''
         SUBSYSTEM=="vfio", GROUP="kvm"
